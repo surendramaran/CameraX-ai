@@ -1,8 +1,10 @@
 package com.example.square
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.media.Image
 import android.os.Build
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
@@ -21,10 +23,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.square.databinding.ActivityMainBinding
-import com.google.mlkit.common.model.LocalModel
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import org.tensorflow.lite.Interpreter
+import java.io.File
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.*
@@ -41,8 +41,7 @@ class MainActivity : AppCompatActivity() {
     private var imageAnalyzer: ImageAnalysis? = null
     private var camera: Camera? = null
     private var cameraProvider: ProcessCameraProvider? = null
-    private var cameraController: LifecycleCameraController? = null
-    private var previewView: PreviewView? = null
+    private lateinit var detector: HandLandmarkDetector
 
     private lateinit var cameraExecutor: ExecutorService
 
@@ -101,10 +100,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
-//        cameraController = LifecycleCameraController(baseContext)
-//        previewView = binding.viewFinder
-
-
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             cameraProvider  = cameraProviderFuture.get()
@@ -136,12 +131,11 @@ class MainActivity : AppCompatActivity() {
             .setTargetRotation(rotation)
             .build()
 
-        val options = ObjectDetectorOptions.Builder()
-            .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-            .enableClassification()
-            .build()
+        val modelFile = File(applicationContext.filesDir, "hand_landmark.tflite")
+        val model = Interpreter(modelFile)
 
-        val objectDetector = ObjectDetection.getClient(options)
+        val inputShape = model.getInputTensor(0).shape()
+        val outputShape = model.getOutputTensor(0).shape()
 
         imageAnalyzer = ImageAnalysis.Builder()
             .setTargetResolution(size)
@@ -150,51 +144,14 @@ class MainActivity : AppCompatActivity() {
             .build()
 
         imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
+            val inputBuffer = convertYuv420ToByteBuffer(imageProxy.image!!)
+            val outputBuffer = Array(1) { FloatArray(63 * 3) }
+            model.run(inputBuffer, outputBuffer)
 
-            val rotationDegree = imageProxy.imageInfo.rotationDegrees
-            val image = imageProxy.image
+            // Extract hand landmarks from outputBuffer and do something with them
 
-            if (image != null) {
-                val processImage = InputImage.fromMediaImage(image, rotationDegree)
-                //            val buffer = imageProxy.planes[0].buffer
-//            val image = InputImage.fromByteBuffer(
-//                buffer,
-//                1280,
-//                720,
-//                binding.viewFinder.display.rotation,
-//                InputImage.IMAGE_FORMAT_NV21
-//            )
-                objectDetector.process(processImage)
-                    .addOnSuccessListener { detectedObjects ->
-
-                        for (i in detectedObjects) {
-                            val x = i.labels.firstOrNull()?.text ?: "not"
-                            binding.imageCaptureButton.text = x
-                        }
-
-                    // Filter for palm objects
-//                  val palmObjects = detectedObjects.filter {
-//                      it.labels.any { label ->
-//                          label.text == "palm"
-//                      }
-//                  }
-
-//
-//                        // Get the bounding box of the largest palm object
-//                        val largestPalm = palmObjects.maxByOrNull {
-//                            it.boundingBox.width() * it.boundingBox.height()
-//                        }
-//                        largestPalm?.let {
-//                            Toast.makeText(this, detectedObjects.toString(), Toast.LENGTH_LONG).show()
-//                        }
-                    }.addOnFailureListener { e ->
-                        Toast.makeText(this, e.toString(), Toast.LENGTH_LONG).show()
-                    }
-                    .addOnCompleteListener {
-                        imageProxy.close()
-                    }
-                }
-            }
+            imageProxy.close()
+        }
 
         cameraProvider?.unbindAll()
 
@@ -213,49 +170,57 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private class LuminosityAnalyzer(private val listener: LumaListener) : ImageAnalysis.Analyzer {
+    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+    class GestureAnalyzer(private val onGestureDetected: (Int) -> Unit) : ImageAnalysis.Analyzer {
 
-        private fun ByteBuffer.toByteArray(): ByteArray {
-            rewind()    // Rewind the buffer to zero
-            val data = ByteArray(remaining())
-            get(data)   // Copy the buffer into a byte array
-            return data // Return the byte array
-        }
+        private val analyzer = MLGestureAnalyzerFactory
+            .getInstance().gestureAnalyzer
 
-        override fun analyze(image: ImageProxy) {
-            val buffer = image.planes[0].buffer
-            val data = buffer.toByteArray()
-            val pixels = data.map { it.toInt() and 0xFF }
-            val luma = pixels.average()
+        private var inprogress = false
 
-            listener(luma)
-
-            image.close()
+        override fun analyze(imageProxy: ImageProxy) {
+            if (inprogress) {
+                return
+            }
+            imageProxy.image?.let {
+                inprogress = true
+                analyzer.asyncAnalyseFrame(MLFrame.fromMediaImage(it, 1))
+                    .addOnSuccessListener { list ->
+                        if (list.isNotEmpty()) {
+                            val category = list.first().category
+                            onGestureDetected.invoke(category)
+                            Log.d(TAG, "onGestureDetected: $category")
+                        }
+                        inprogress = false
+                        imageProxy.close()
+                    }.addOnFailureListener {
+                        Log.e(TAG, it.toString())
+                        inprogress = false
+                        imageProxy.close()
+                    }
+            }
         }
     }
 
-//    private class YourImageAnalyzer : ImageAnalysis.Analyzer {
-//        private fun ByteBuffer.toByteArray(): ByteArray {
-//            rewind()    // Rewind the buffer to zero
-//            val data = ByteArray(remaining())
-//            get(data)   // Copy the buffer into a byte array
-//            return data // Return the byte array
-//        }
-//
-//        override fun analyze(image: ImageProxy) {
-//            val buffer = image.planes[0].buffer
-//            val inputImage = InputImage.fromByteBuffer(
-//                buffer,
-//                /* image width */ 480,
-//                /* image height */ 360,
-//                rotationDegrees,
-//                InputImage.IMAGE_FORMAT_NV21 // or IMAGE_FORMAT_YV12
-//            )
-//
-//            image.close()
-//        }
-//    }
+    private fun convertYuv420ToByteBuffer(image: Image): ByteBuffer {
+        val y = image.planes[0].buffer
+        val u = image.planes[1].buffer
+        val v = image.planes[2].buffer
 
+        val ySize = y.remaining()
+        val uSize = u.remaining()
+        val vSize = v.remaining()
+
+        val data = ByteArray(ySize + uSize + vSize)
+
+        y.get(data, 0, ySize)
+        u.get(data, ySize, uSize)
+        v.get(data, ySize + uSize, vSize)
+
+        val buffer = ByteBuffer.allocateDirect(data.size)
+        buffer.put(data)
+        return buffer
+    }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
