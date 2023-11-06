@@ -131,7 +131,7 @@ class MainActivity : AppCompatActivity() {
             .setTargetRotation(rotation)
             .build()
 
-        val modelFile = File(applicationContext.filesDir, "hand_landmark.tflite")
+        val modelFile = File(applicationContext.filesDir, "object_detection.tflite")
         val model = Interpreter(modelFile)
 
         val inputShape = model.getInputTensor(0).shape()
